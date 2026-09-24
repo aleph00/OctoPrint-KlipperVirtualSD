@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.0 — 2026-09-25
+
+- Add optional automatic MCU recovery after an OctoPrint serial connection.
+- Query Klipper through its official Unix-domain API socket instead of parsing terminal output.
+- If Klipper reports `ready`, do nothing.
+- If Klipper reports `startup`, wait briefly and query once more.
+- If Klipper reports `shutdown` or `error`, request `gcode/firmware_restart` through the Klipper API.
+- Never restart automatically while OctoPrint reports an active or paused job.
+- Add settings for enabling/disabling automatic recovery and configuring the Klippy API socket path.
+- Default Klippy API socket: `/run/klipper/klippy.sock`.
+
 ## 0.8.1 — 2026-09-24
 
 - Keep the v0.8 metadata compatibility fix.
