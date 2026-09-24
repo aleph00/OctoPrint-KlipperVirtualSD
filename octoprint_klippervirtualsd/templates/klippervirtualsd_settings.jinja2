@@ -1,0 +1,32 @@
+<form class="form-horizontal">
+    <div class="control-group">
+        <label class="control-label">
+            Automatic MCU recovery
+        </label>
+        <div class="controls">
+            <label class="checkbox">
+                <input type="checkbox"
+                       data-bind="checked: settings.plugins.klippervirtualsd.auto_mcu_recovery">
+                Run Klipper's <code>FIRMWARE_RESTART</code> automatically
+                when OctoPrint reconnects and the Klippy API reports
+                <code>shutdown</code> or <code>error</code>.
+            </label>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">
+            Klippy API socket
+        </label>
+        <div class="controls">
+            <input type="text"
+                   class="input-xxlarge"
+                   data-bind="value: settings.plugins.klippervirtualsd.klippy_socket"
+                   placeholder="/run/klipper/klippy.sock">
+            <span class="help-block">
+                Unix-domain socket created by Klipper's <code>-a</code>
+                command-line option. No terminal-output parsing is used.
+            </span>
+        </div>
+    </div>
+</form>
