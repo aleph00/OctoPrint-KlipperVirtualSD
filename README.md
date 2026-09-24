@@ -43,6 +43,9 @@ This plugin bridges the two worlds:
 - OctoPrint.
 - The Klipper virtual-SD path must point to the same directory where
   OctoPrint stores uploaded G-code files.
+- If automatic MCU recovery is enabled, the OctoPrint service user must have
+  read/write access to the Klippy API socket (by default
+  `/run/klipper/klippy.sock`) and access to its parent directory.
 
 Example Klipper configuration:
 
@@ -54,6 +57,15 @@ on_error_gcode:
 ```
 
 The Klipper process must have permission to read that directory.
+
+For the Klippy API socket, a shared group between the Klipper and OctoPrint
+services is a convenient setup. For example, the socket may look like:
+
+```text
+srwxrwx--- klipper 3d_print /run/klipper/klippy.sock
+```
+
+with the `octoprint` user belonging to the `3d_print` group.
 
 ## Automatic MCU recovery
 
