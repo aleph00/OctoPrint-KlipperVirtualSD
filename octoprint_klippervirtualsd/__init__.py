@@ -1,5 +1,9 @@
 import copy
+import json
 import os
+import socket
+import threading
+import time
 
 import flask
 import octoprint.plugin
@@ -10,17 +14,246 @@ class KlipperVirtualSDPlugin(
     octoprint.plugin.ShutdownPlugin,
     octoprint.plugin.AssetPlugin,
     octoprint.plugin.SimpleApiPlugin,
+    octoprint.plugin.EventHandlerPlugin,
+    octoprint.plugin.SettingsPlugin,
+    octoprint.plugin.TemplatePlugin,
 ):
     def on_after_startup(self):
+        self._recovery_lock = threading.Lock()
+        self._recovery_running = False
         self._install_storage_alias()
         self._install_current_job_alias()
         self._install_current_data_alias()
-        self._logger.info("KlipperVirtualSD 0.8.1 ready")
+        self._logger.info(
+            "KlipperVirtualSD 0.9.0 ready "
+            "(automatic MCU recovery=%s, socket=%s)",
+            self._settings.get_boolean(["auto_mcu_recovery"]),
+            self._settings.get(["klippy_socket"]),
+        )
 
     def on_shutdown(self):
         self._remove_current_data_alias()
         self._remove_current_job_alias()
         self._remove_storage_alias()
+
+    # ----------------------------------------------------------------------
+    # Settings
+    # ----------------------------------------------------------------------
+    def get_settings_defaults(self):
+        return dict(
+            auto_mcu_recovery=True,
+            klippy_socket="/run/klipper/klippy.sock",
+        )
+
+    def get_template_configs(self):
+        return [
+            dict(
+                type="settings",
+                name="Klipper Virtual SD",
+                custom_bindings=False,
+            )
+        ]
+
+    # ----------------------------------------------------------------------
+    # Automatic MCU recovery through Klipper's official API socket
+    # ----------------------------------------------------------------------
+    def on_event(self, event, payload):
+        if event != "Connected":
+            return
+        if not self._settings.get_boolean(["auto_mcu_recovery"]):
+            return
+
+        # Give the OctoPrint/Klipper serial connection a moment to settle.
+        timer = threading.Timer(0.75, self._check_klipper_state_after_connect)
+        timer.daemon = True
+        timer.start()
+
+    def _check_klipper_state_after_connect(self):
+        with self._recovery_lock:
+            if self._recovery_running:
+                return
+            self._recovery_running = True
+
+        try:
+            socket_path = self._settings.get(["klippy_socket"])
+            if not socket_path:
+                self._logger.warning(
+                    "Automatic MCU recovery enabled but Klippy socket path "
+                    "is empty"
+                )
+                return
+
+            # `info` is a documented Klipper API endpoint and directly
+            # returns the host state: ready/startup/shutdown/error.
+            response = self._klippy_api_request(
+                socket_path,
+                "info",
+                params={
+                    "client_info": {
+                        "name": "OctoPrint-KlipperVirtualSD",
+                        "version": "0.9.0",
+                    }
+                },
+                timeout=2.0,
+            )
+
+            result = response.get("result", {})
+            state = result.get("state")
+            state_message = result.get("state_message", "")
+
+            self._logger.info(
+                "Klippy API state after OctoPrint connection: %s%s",
+                state,
+                " (%s)" % state_message if state_message else "",
+            )
+
+            if state == "ready":
+                # This includes an idle printer as well as a printer that is
+                # actively printing.  Never disturb a healthy Klipper session.
+                return
+
+            if state == "startup":
+                # Startup can be transient.  Wait briefly and query once more
+                # instead of restarting a Klipper instance that is still
+                # legitimately initializing.
+                time.sleep(1.5)
+                response = self._klippy_api_request(
+                    socket_path,
+                    "info",
+                    params={
+                        "client_info": {
+                            "name": "OctoPrint-KlipperVirtualSD",
+                            "version": "0.9.0",
+                        }
+                    },
+                    timeout=2.0,
+                )
+                result = response.get("result", {})
+                state = result.get("state")
+                state_message = result.get("state_message", "")
+                self._logger.info(
+                    "Klippy API state after startup retry: %s%s",
+                    state,
+                    " (%s)" % state_message if state_message else "",
+                )
+                if state == "ready":
+                    return
+
+            if state not in ("shutdown", "error"):
+                self._logger.warning(
+                    "Klippy API returned unexpected state %r; "
+                    "automatic recovery skipped",
+                    state,
+                )
+                return
+
+            # Belt-and-suspenders protection.  A healthy active print should
+            # have state=ready, but never restart if OctoPrint says a job is
+            # active even if the API state looks abnormal.
+            if self._printer.is_printing() or self._printer.is_paused():
+                self._logger.warning(
+                    "Klippy reports %s but OctoPrint has an active job; "
+                    "automatic FIRMWARE_RESTART skipped",
+                    state,
+                )
+                return
+
+            self._logger.warning(
+                "Klippy state is %s after OctoPrint connection; "
+                "requesting FIRMWARE_RESTART via Klipper API",
+                state,
+            )
+
+            # Use Klipper's dedicated API endpoint rather than parsing terminal
+            # output or injecting a G-code command through OctoPrint.
+            try:
+                self._klippy_api_request(
+                    socket_path,
+                    "gcode/firmware_restart",
+                    params={},
+                    timeout=2.0,
+                )
+            except (ConnectionResetError, BrokenPipeError, EOFError):
+                # A firmware restart may tear down the API connection before
+                # the reply reaches us.  That is expected.
+                self._logger.info(
+                    "Klippy API connection closed during FIRMWARE_RESTART "
+                    "(expected)"
+                )
+
+        except FileNotFoundError:
+            self._logger.warning(
+                "Klippy API socket not found at %s; automatic MCU recovery "
+                "skipped. Ensure Klipper is started with '-a <socket>'.",
+                self._settings.get(["klippy_socket"]),
+            )
+        except PermissionError:
+            self._logger.warning(
+                "Permission denied opening Klippy API socket %s; automatic "
+                "MCU recovery skipped",
+                self._settings.get(["klippy_socket"]),
+            )
+        except (socket.timeout, TimeoutError):
+            self._logger.warning(
+                "Timed out while querying Klippy API socket %s; automatic "
+                "MCU recovery skipped",
+                self._settings.get(["klippy_socket"]),
+            )
+        except Exception:
+            self._logger.exception(
+                "Automatic Klipper MCU recovery check failed"
+            )
+        finally:
+            with self._recovery_lock:
+                self._recovery_running = False
+
+    def _klippy_api_request(
+        self, socket_path, method, params=None, timeout=2.0
+    ):
+        """
+        Send one request to Klipper's Unix-domain API socket.
+
+        Klipper frames JSON messages with ASCII ETX (0x03).  Read until the
+        response carrying our request id arrives; ignore unrelated async
+        messages if any are present on the connection.
+        """
+        request_id = int(time.time() * 1000000) & 0x7FFFFFFF
+        request = {
+            "id": request_id,
+            "method": method,
+            "params": params or {},
+        }
+        payload = (
+            json.dumps(request, separators=(",", ":")).encode("utf-8")
+            + b"\x03"
+        )
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(socket_path)
+            sock.sendall(payload)
+
+            buffer = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise EOFError(
+                        "Klippy API connection closed before response"
+                    )
+                buffer += chunk
+
+                while b"\x03" in buffer:
+                    raw, buffer = buffer.split(b"\x03", 1)
+                    if not raw:
+                        continue
+                    message = json.loads(raw.decode("utf-8"))
+                    if message.get("id") != request_id:
+                        continue
+                    if "error" in message:
+                        raise RuntimeError(
+                            "Klippy API error: %s" % message["error"]
+                        )
+                    return message
 
     # ----------------------------------------------------------------------
     # FileManager compatibility layer
@@ -63,17 +296,6 @@ class KlipperVirtualSDPlugin(
 
     # ----------------------------------------------------------------------
     # Current-job metadata compatibility layer
-    #
-    # OctoPrint deliberately treats a firmware-SD job as origin="sdcard".
-    # In our setup the "SD card" is really Klipper's virtual_sdcard and the
-    # file still exists in OctoPrint's local storage.  OctoPrint therefore
-    # loses the local analysis metadata (filament, estimated print time,
-    # date...) when building /api/job.
-    #
-    # v0.7 augments get_current_job() for virtual-SD jobs using the already
-    # existing local file metadata.  Plugins such as SpoolManager and
-    # PrintJobHistory that ask OctoPrint for the current job then see the
-    # same analysis information as for a normal local print.
     # ----------------------------------------------------------------------
     def _install_current_job_alias(self):
         printer = self._printer
@@ -144,7 +366,6 @@ class KlipperVirtualSDPlugin(
         if not isinstance(metadata, dict):
             return job
 
-        # Do not mutate OctoPrint's own cached object in place.
         result = copy.deepcopy(job)
         result_file = result.setdefault("file", {})
         analysis = metadata.get("analysis")
@@ -153,26 +374,19 @@ class KlipperVirtualSDPlugin(
 
         changed = []
 
-        # Filament analysis.  Standard OctoPrint G-code analysis normally
-        # stores this as:
-        #   {"tool0": {"length": <mm>, "volume": <cm3>}}
         filament = analysis.get("filament")
         if filament is not None and not result.get("filament"):
             result["filament"] = copy.deepcopy(filament)
             changed.append("filament")
 
-        # Estimated print time.
         estimated = analysis.get("estimatedPrintTime")
         if estimated is None:
-            # Some analyzers/plugins use this key.
             estimated = analysis.get("analysisPrintTime")
 
         if estimated is not None and result.get("estimatedPrintTime") is None:
             result["estimatedPrintTime"] = estimated
             changed.append("estimatedPrintTime")
 
-        # Last modified timestamp.  Prefer metadata, otherwise use the real
-        # local file stat.
         date = metadata.get("date")
         if date is None:
             date = metadata.get("modified")
@@ -187,8 +401,6 @@ class KlipperVirtualSDPlugin(
             result_file["date"] = date
             changed.append("date")
 
-        # Size is normally already supplied by the firmware-SD job, but fill
-        # it if OctoPrint did not provide it.
         if result_file.get("size") is None:
             try:
                 local_path = self._file_manager.path_on_disk("local", path)
@@ -208,11 +420,6 @@ class KlipperVirtualSDPlugin(
 
     # ----------------------------------------------------------------------
     # Current-data compatibility layer
-    #
-    # /api/job may be built from PrinterInterface.get_current_data() rather
-    # than directly from get_current_job().  v0.8 therefore augments both
-    # paths.  This is also useful for plugins which consume the state monitor
-    # structure instead of calling get_current_job() themselves.
     # ----------------------------------------------------------------------
     def _install_current_data_alias(self):
         printer = self._printer
@@ -349,7 +556,7 @@ class KlipperVirtualSDPlugin(
 
 
 __plugin_name__ = "Klipper Virtual SD Print"
-__plugin_version__ = "0.8.1"
+__plugin_version__ = "0.9.0"
 __plugin_pythoncompat__ = ">=3.7,<4"
 
 
