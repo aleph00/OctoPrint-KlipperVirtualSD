@@ -35,6 +35,7 @@ This plugin bridges the two worlds:
   - file date;
   - file size.
 - Tested with SpoolManager, PrintJobHistory and Dashboard.
+- Optional automatic MCU recovery after OctoPrint reconnects.
 
 ## Requirements
 
@@ -54,6 +55,37 @@ on_error_gcode:
 
 The Klipper process must have permission to read that directory.
 
+## Automatic MCU recovery
+
+Version 0.9.0 can recover automatically when OctoPrint reconnects while Klipper
+is in `shutdown` or `error` because the MCU was powered off or restarted.
+
+The plugin queries Klipper through its official Unix-domain API socket:
+
+- `ready` → do nothing;
+- `startup` → wait briefly and query once more;
+- `shutdown` or `error` → request `gcode/firmware_restart`;
+- active or paused OctoPrint job → never restart automatically.
+
+This feature is optional and can be disabled in the plugin settings.
+
+By default the plugin expects the Klippy API socket at:
+
+```text
+/run/klipper/klippy.sock
+```
+
+Klipper must be started with the `-a` option pointing to that socket, for
+example:
+
+```text
+-a /run/klipper/klippy.sock
+```
+
+The OctoPrint process also needs permission to connect to the socket. A shared
+group between the Klipper and OctoPrint services is a convenient way to grant
+that access.
+
 ## Installation
 
 Install directly from the repository URL in OctoPrint's Plugin Manager, or
@@ -70,6 +102,7 @@ Known working setup:
 - OctoPrint 1.11.7
 - Klipper
 - shared OctoPrint uploads / Klipper `virtual_sdcard` directory
+- Klippy API socket at `/run/klipper/klippy.sock`
 
 Other versions may work but have not yet been validated.
 
@@ -82,11 +115,18 @@ The plugin provides compatibility shims so OctoPrint and its plugins can still
 resolve the virtual-SD file against local storage and access the original
 analysis metadata.
 
+For automatic MCU recovery, the plugin uses Klipper's JSON API over the Klippy
+Unix socket instead of parsing terminal output.
+
 ## Caveats
 
 This plugin intentionally relies on some OctoPrint internal interfaces to
 bridge local-file and firmware-SD behaviour. Test new OctoPrint versions before
 upgrading a production printer.
+
+Automatic MCU recovery requires a working and accessible Klippy API socket.
+If the socket is missing or inaccessible, the recovery check is skipped and the
+rest of the plugin continues to work normally.
 
 ## License
 
