@@ -3,6 +3,8 @@
 Use OctoPrint's normal **Print** workflow while executing the G-code through
 Klipper's `virtual_sdcard`.
 
+**Use Klipper `virtual_sdcard` with OctoPrint without losing OctoPrint job tracking, filament metadata, print-time estimates or plugin integration.**
+
 The goal is simple: keep OctoPrint as the UI, job tracker and plugin host, but
 remove live G-code streaming from the timing-critical path.
 
